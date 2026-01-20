@@ -666,8 +666,10 @@ export class LoadBalancer extends DurableObject {
 
 	private adjustSchema(schema: any) {
 		const obj = schema[schema.type];
-		delete obj.strict;
-		return this.adjustProps(schema);
+		if (obj && typeof obj === 'object') {
+			delete obj.strict;
+			this.adjustProps(obj);
+		}
 	}
 
 	private adjustProps(schemaPart: any) {
