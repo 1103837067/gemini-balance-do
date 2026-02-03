@@ -202,6 +202,12 @@ export class LoadBalancer extends DurableObject {
 			return this.handleOpenAI(request);
 		}
 
+		// OpenAI Responses API route
+		if (pathname.endsWith('/responses') || pathname.match(/\/responses\/[^/]+$/)) {
+			console.log('[fetch] OpenAI Responses API route detected');
+			return this.handleResponsesAPI(request);
+		}
+
 		// Direct Gemini proxy
 		const authKey = this.env.AUTH_KEY;
 
@@ -1503,6 +1509,699 @@ export class LoadBalancer extends DurableObject {
 			return null;
 		}
 	}
+
+	// ==================== OpenAI Responses API ====================
+
+	/**
+	 * Handle OpenAI Responses API requests
+	 * POST /v1/responses - Create a response
+	 * GET /v1/responses/{id} - Get a response (not implemented, returns error)
+	 * DELETE /v1/responses/{id} - Delete a response (not implemented, returns error)
+	 */
+	private async handleResponsesAPI(request: Request): Promise<Response> {
+		console.log('[handleResponsesAPI] Starting to handle Responses API request');
+		const authKey = this.env.AUTH_KEY;
+		let apiKey: string | null;
+
+		const authHeader = request.headers.get('Authorization');
+		apiKey = authHeader?.replace('Bearer ', '') ?? null;
+		console.log('[handleResponsesAPI] API key provided:', !!apiKey);
+
+		// 如果启用了客户端 key 透传，直接使用客户端提供的 key
+		if (this.env.FORWARD_CLIENT_KEY_ENABLED) {
+			if (!apiKey) {
+				return new Response('No API key found in the client headers, please check your request!', { status: 400 });
+			}
+		} else {
+			// 传统模式：验证 AUTH_KEY 并使用负载均衡
+			if (!apiKey) {
+				return new Response('No API key found in the client headers, please check your request!', { status: 400 });
+			}
+
+			if (authKey) {
+				const token = authHeader?.replace('Bearer ', '');
+				if (token !== authKey) {
+					return new Response('Unauthorized', { status: 401, headers: fixCors({}).headers });
+				}
+				apiKey = await this.getRandomApiKey();
+				if (!apiKey) {
+					return new Response('No API keys configured in the load balancer.', { status: 500 });
+				}
+			}
+		}
+
+		const url = new URL(request.url);
+		const pathname = url.pathname;
+
+		const errHandler = (err: Error) => {
+			console.error('[handleResponsesAPI] Error:', err);
+			const errorResponse = {
+				error: {
+					message: err.message ?? 'Internal Server Error',
+					type: 'server_error',
+					code: 'internal_error',
+				},
+			};
+			return new Response(JSON.stringify(errorResponse), {
+				...fixCors({ headers: { 'Content-Type': 'application/json' } }),
+				status: 500,
+			});
+		};
+
+		try {
+			// POST /v1/responses - Create a response
+			if (request.method === 'POST' && pathname.endsWith('/responses')) {
+				const reqBody = await request.json();
+				return this.handleCreateResponse(reqBody, apiKey).catch(errHandler);
+			}
+
+			// GET /v1/responses/{id} - Not implemented (stateless proxy)
+			if (request.method === 'GET' && pathname.match(/\/responses\/[^/]+$/)) {
+				return new Response(
+					JSON.stringify({
+						error: {
+							message: 'This proxy does not support stateful response retrieval. Use store: false in your requests.',
+							type: 'invalid_request_error',
+							code: 'not_implemented',
+						},
+					}),
+					{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 501 }
+				);
+			}
+
+			// DELETE /v1/responses/{id} - Not implemented
+			if (request.method === 'DELETE' && pathname.match(/\/responses\/[^/]+$/)) {
+				return new Response(
+					JSON.stringify({
+						error: {
+							message: 'This proxy does not support response deletion.',
+							type: 'invalid_request_error',
+							code: 'not_implemented',
+						},
+					}),
+					{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 501 }
+				);
+			}
+
+			return new Response(
+				JSON.stringify({
+					error: {
+						message: 'Method not allowed',
+						type: 'invalid_request_error',
+						code: 'method_not_allowed',
+					},
+				}),
+				{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 405 }
+			);
+		} catch (err: any) {
+			return errHandler(err);
+		}
+	}
+
+	/**
+	 * Create a model response (OpenAI Responses API)
+	 * Converts the request to Gemini format and returns OpenAI Responses format
+	 */
+	private async handleCreateResponse(req: any, apiKey: string): Promise<Response> {
+		console.log('[handleCreateResponse] Processing request');
+
+		const DEFAULT_MODEL = 'gemini-2.5-flash';
+		let model = DEFAULT_MODEL;
+
+		// Parse model from request
+		if (typeof req.model === 'string') {
+			if (req.model.startsWith('models/')) {
+				model = req.model.substring(7);
+			} else if (req.model.startsWith('gemini-') || req.model.startsWith('gemma-') || req.model.startsWith('learnlm-')) {
+				model = req.model;
+			}
+		}
+
+		// Convert Responses API input to Gemini format
+		const geminiBody = await this.convertResponsesInputToGemini(req);
+
+		// Determine if streaming
+		const isStreaming = req.stream === true;
+
+		const TASK = isStreaming ? 'streamGenerateContent' : 'generateContent';
+		let url = `${BASE_URL}/${API_VERSION}/models/${model}:${TASK}`;
+		if (isStreaming) {
+			url += '?alt=sse';
+		}
+
+		console.log('[handleCreateResponse] Calling Gemini API:', url, 'streaming:', isStreaming);
+
+		const response = await fetch(url, {
+			method: 'POST',
+			headers: makeHeaders(apiKey, { 'Content-Type': 'application/json' }),
+			body: JSON.stringify(geminiBody),
+		});
+
+		if (!response.ok) {
+			const errorText = await response.text();
+			console.error('[handleCreateResponse] Gemini API error:', response.status, errorText);
+			return new Response(
+				JSON.stringify({
+					error: {
+						message: `Gemini API error: ${errorText}`,
+						type: 'api_error',
+						code: 'upstream_error',
+					},
+				}),
+				{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: response.status }
+			);
+		}
+
+		// Generate response IDs
+		const responseId = 'resp_' + this.generateId();
+		const messageId = 'msg_' + this.generateId();
+		const createdAt = Math.floor(Date.now() / 1000);
+
+		if (isStreaming) {
+			// Stream response
+			return this.handleResponsesStream(response, model, responseId, messageId, createdAt, req);
+		} else {
+			// Non-streaming response
+			return this.handleResponsesNonStream(response, model, responseId, messageId, createdAt, req);
+		}
+	}
+
+	/**
+	 * Convert OpenAI Responses API input to Gemini format
+	 */
+	private async convertResponsesInputToGemini(req: any): Promise<any> {
+		const harmCategory = [
+			'HARM_CATEGORY_HATE_SPEECH',
+			'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+			'HARM_CATEGORY_DANGEROUS_CONTENT',
+			'HARM_CATEGORY_HARASSMENT',
+			'HARM_CATEGORY_CIVIC_INTEGRITY',
+		];
+
+		const safetySettings = harmCategory.map((category) => ({
+			category,
+			threshold: 'BLOCK_NONE',
+		}));
+
+		const contents: any[] = [];
+
+		// Handle instructions (system message)
+		if (req.instructions) {
+			contents.push({
+				role: 'user',
+				parts: [{ text: `[System Instructions]\n${req.instructions}` }],
+			});
+			contents.push({
+				role: 'model',
+				parts: [{ text: 'Understood. I will follow these instructions.' }],
+			});
+		}
+
+		// Handle input - can be string or array
+		if (typeof req.input === 'string') {
+			contents.push({
+				role: 'user',
+				parts: [{ text: req.input }],
+			});
+		} else if (Array.isArray(req.input)) {
+			for (const item of req.input) {
+				if (item.type === 'message') {
+					const role = item.role === 'assistant' ? 'model' : 'user';
+					const parts: any[] = [];
+
+					if (Array.isArray(item.content)) {
+						for (const contentPart of item.content) {
+							if (contentPart.type === 'input_text' || contentPart.type === 'output_text') {
+								parts.push({ text: contentPart.text });
+							} else if (contentPart.type === 'input_image') {
+								// Handle image input
+								if (contentPart.image_url) {
+									parts.push({
+										inlineData: {
+											mimeType: 'image/jpeg',
+											data: contentPart.image_url.replace(/^data:image\/[^;]+;base64,/, ''),
+										},
+									});
+								}
+							}
+						}
+					} else if (typeof item.content === 'string') {
+						parts.push({ text: item.content });
+					}
+
+					if (parts.length > 0) {
+						contents.push({ role, parts });
+					}
+				} else if (item.role) {
+					// Simple message format
+					const role = item.role === 'assistant' ? 'model' : 'user';
+					const parts: any[] = [];
+
+					if (Array.isArray(item.content)) {
+						for (const contentPart of item.content) {
+							if (typeof contentPart === 'string') {
+								parts.push({ text: contentPart });
+							} else if (contentPart.type === 'text' || contentPart.type === 'input_text') {
+								parts.push({ text: contentPart.text });
+							}
+						}
+					} else if (typeof item.content === 'string') {
+						parts.push({ text: item.content });
+					}
+
+					if (parts.length > 0) {
+						contents.push({ role, parts });
+					}
+				}
+			}
+		}
+
+		// Build generation config
+		const generationConfig: any = {};
+		if (req.temperature !== undefined) generationConfig.temperature = req.temperature;
+		if (req.top_p !== undefined) generationConfig.topP = req.top_p;
+		if (req.max_output_tokens !== undefined) generationConfig.maxOutputTokens = req.max_output_tokens;
+
+		// Handle function tools
+		const tools: any[] = [];
+		if (Array.isArray(req.tools)) {
+			const functionDeclarations: any[] = [];
+			for (const tool of req.tools) {
+				if (tool.type === 'function') {
+					functionDeclarations.push({
+						name: tool.name,
+						description: tool.description,
+						parameters: tool.parameters,
+					});
+				}
+			}
+			if (functionDeclarations.length > 0) {
+				tools.push({ function_declarations: functionDeclarations });
+			}
+		}
+
+		return {
+			contents,
+			safetySettings,
+			generationConfig,
+			...(tools.length > 0 ? { tools } : {}),
+		};
+	}
+
+	/**
+	 * Handle non-streaming response for Responses API
+	 */
+	private async handleResponsesNonStream(
+		response: Response,
+		model: string,
+		responseId: string,
+		messageId: string,
+		createdAt: number,
+		req: any
+	): Promise<Response> {
+		let geminiResponse: any;
+		try {
+			geminiResponse = await response.json();
+		} catch (err) {
+			console.error('[handleResponsesNonStream] Failed to parse Gemini response:', err);
+			return new Response(
+				JSON.stringify({
+					error: {
+						message: 'Failed to parse Gemini response',
+						type: 'api_error',
+						code: 'parse_error',
+					},
+				}),
+				{ ...fixCors({ headers: { 'Content-Type': 'application/json' } }), status: 500 }
+			);
+		}
+
+		// Extract text from Gemini response
+		let outputText = '';
+		const candidate = geminiResponse.candidates?.[0];
+		if (candidate?.content?.parts) {
+			for (const part of candidate.content.parts) {
+				if (part.text) {
+					outputText += part.text;
+				}
+			}
+		}
+
+		// Extract usage info
+		const usageMetadata = geminiResponse.usageMetadata || {};
+		const inputTokens = usageMetadata.promptTokenCount || 0;
+		const outputTokens = usageMetadata.candidatesTokenCount || 0;
+
+		// Build OpenAI Responses API response
+		const openAIResponse = {
+			id: responseId,
+			object: 'response',
+			created_at: createdAt,
+			status: 'completed',
+			completed_at: Math.floor(Date.now() / 1000),
+			error: null,
+			incomplete_details: null,
+			instructions: req.instructions || null,
+			max_output_tokens: req.max_output_tokens || null,
+			model: model,
+			output: [
+				{
+					type: 'message',
+					id: messageId,
+					status: 'completed',
+					role: 'assistant',
+					content: [
+						{
+							type: 'output_text',
+							text: outputText,
+							annotations: [],
+						},
+					],
+				},
+			],
+			parallel_tool_calls: req.parallel_tool_calls ?? true,
+			previous_response_id: req.previous_response_id || null,
+			reasoning: {
+				effort: null,
+				summary: null,
+			},
+			store: req.store ?? true,
+			temperature: req.temperature ?? 1.0,
+			text: {
+				format: {
+					type: 'text',
+				},
+			},
+			tool_choice: req.tool_choice ?? 'auto',
+			tools: req.tools || [],
+			top_p: req.top_p ?? 1.0,
+			truncation: req.truncation ?? 'disabled',
+			usage: {
+				input_tokens: inputTokens,
+				input_tokens_details: {
+					cached_tokens: 0,
+				},
+				output_tokens: outputTokens,
+				output_tokens_details: {
+					reasoning_tokens: 0,
+				},
+				total_tokens: inputTokens + outputTokens,
+			},
+			user: req.user || null,
+			metadata: req.metadata || {},
+		};
+
+		return new Response(JSON.stringify(openAIResponse), {
+			...fixCors({ headers: { 'Content-Type': 'application/json' } }),
+		});
+	}
+
+	/**
+	 * Handle streaming response for Responses API
+	 */
+	private handleResponsesStream(
+		response: Response,
+		model: string,
+		responseId: string,
+		messageId: string,
+		createdAt: number,
+		req: any
+	): Response {
+		const encoder = new TextEncoder();
+		let sequenceNumber = 0;
+
+		const that = this;
+
+		const stream = new ReadableStream({
+			async start(controller) {
+				// Helper to send SSE event
+				const sendEvent = (data: any) => {
+					controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+				};
+
+				// 1. response.created
+				sendEvent({
+					type: 'response.created',
+					response: {
+						id: responseId,
+						object: 'response',
+						created_at: createdAt,
+						status: 'in_progress',
+						completed_at: null,
+						error: null,
+						incomplete_details: null,
+						instructions: req.instructions || null,
+						max_output_tokens: req.max_output_tokens || null,
+						model: model,
+						output: [],
+						parallel_tool_calls: req.parallel_tool_calls ?? true,
+						previous_response_id: req.previous_response_id || null,
+						reasoning: { effort: null, summary: null },
+						store: req.store ?? true,
+						temperature: req.temperature ?? 1.0,
+						text: { format: { type: 'text' } },
+						tool_choice: req.tool_choice ?? 'auto',
+						tools: req.tools || [],
+						top_p: req.top_p ?? 1.0,
+						truncation: req.truncation ?? 'disabled',
+						usage: null,
+						user: req.user || null,
+						metadata: req.metadata || {},
+					},
+					sequence_number: ++sequenceNumber,
+				});
+
+				// 2. response.in_progress
+				sendEvent({
+					type: 'response.in_progress',
+					response: {
+						id: responseId,
+						object: 'response',
+						created_at: createdAt,
+						status: 'in_progress',
+						completed_at: null,
+						error: null,
+						incomplete_details: null,
+						instructions: req.instructions || null,
+						max_output_tokens: req.max_output_tokens || null,
+						model: model,
+						output: [],
+						parallel_tool_calls: req.parallel_tool_calls ?? true,
+						previous_response_id: req.previous_response_id || null,
+						reasoning: { effort: null, summary: null },
+						store: req.store ?? true,
+						temperature: req.temperature ?? 1.0,
+						text: { format: { type: 'text' } },
+						tool_choice: req.tool_choice ?? 'auto',
+						tools: req.tools || [],
+						top_p: req.top_p ?? 1.0,
+						truncation: req.truncation ?? 'disabled',
+						usage: null,
+						user: req.user || null,
+						metadata: req.metadata || {},
+					},
+					sequence_number: ++sequenceNumber,
+				});
+
+				// 3. response.output_item.added
+				sendEvent({
+					type: 'response.output_item.added',
+					output_index: 0,
+					item: {
+						id: messageId,
+						status: 'in_progress',
+						type: 'message',
+						role: 'assistant',
+						content: [],
+					},
+					sequence_number: ++sequenceNumber,
+				});
+
+				// 4. response.content_part.added
+				sendEvent({
+					type: 'response.content_part.added',
+					item_id: messageId,
+					output_index: 0,
+					content_index: 0,
+					part: {
+						type: 'output_text',
+						text: '',
+						annotations: [],
+					},
+					sequence_number: ++sequenceNumber,
+				});
+
+				// Process Gemini SSE stream
+				const reader = response.body!.getReader();
+				const decoder = new TextDecoder();
+				let buffer = '';
+				let fullText = '';
+				let inputTokens = 0;
+				let outputTokens = 0;
+
+				try {
+					while (true) {
+						const { done, value } = await reader.read();
+						if (done) break;
+
+						buffer += decoder.decode(value, { stream: true });
+						const lines = buffer.split('\n');
+						buffer = lines.pop() || '';
+
+						for (const line of lines) {
+							if (line.startsWith('data: ')) {
+								const dataStr = line.substring(6).trim();
+								if (!dataStr || dataStr === '[DONE]') continue;
+
+								try {
+									const data = JSON.parse(dataStr);
+									const candidate = data.candidates?.[0];
+
+									if (candidate?.content?.parts) {
+										for (const part of candidate.content.parts) {
+											if (part.text) {
+												fullText += part.text;
+
+												// Send text delta
+												sendEvent({
+													type: 'response.output_text.delta',
+													item_id: messageId,
+													output_index: 0,
+													content_index: 0,
+													delta: part.text,
+													sequence_number: ++sequenceNumber,
+												});
+											}
+										}
+									}
+
+									// Extract usage from final chunk
+									if (data.usageMetadata) {
+										inputTokens = data.usageMetadata.promptTokenCount || inputTokens;
+										outputTokens = data.usageMetadata.candidatesTokenCount || outputTokens;
+									}
+								} catch (parseErr) {
+									console.error('[handleResponsesStream] Failed to parse SSE data:', parseErr);
+								}
+							}
+						}
+					}
+				} catch (streamErr) {
+					console.error('[handleResponsesStream] Stream error:', streamErr);
+				}
+
+				// 5. response.output_text.done
+				sendEvent({
+					type: 'response.output_text.done',
+					item_id: messageId,
+					output_index: 0,
+					content_index: 0,
+					text: fullText,
+					sequence_number: ++sequenceNumber,
+				});
+
+				// 6. response.content_part.done
+				sendEvent({
+					type: 'response.content_part.done',
+					item_id: messageId,
+					output_index: 0,
+					content_index: 0,
+					part: {
+						type: 'output_text',
+						text: fullText,
+						annotations: [],
+					},
+					sequence_number: ++sequenceNumber,
+				});
+
+				// 7. response.output_item.done
+				sendEvent({
+					type: 'response.output_item.done',
+					output_index: 0,
+					item: {
+						id: messageId,
+						status: 'completed',
+						type: 'message',
+						role: 'assistant',
+						content: [
+							{
+								type: 'output_text',
+								text: fullText,
+								annotations: [],
+							},
+						],
+					},
+					sequence_number: ++sequenceNumber,
+				});
+
+				// 8. response.completed
+				const completedAt = Math.floor(Date.now() / 1000);
+				sendEvent({
+					type: 'response.completed',
+					response: {
+						id: responseId,
+						object: 'response',
+						created_at: createdAt,
+						status: 'completed',
+						completed_at: completedAt,
+						error: null,
+						incomplete_details: null,
+						instructions: req.instructions || null,
+						max_output_tokens: req.max_output_tokens || null,
+						model: model,
+						output: [
+							{
+								type: 'message',
+								id: messageId,
+								status: 'completed',
+								role: 'assistant',
+								content: [
+									{
+										type: 'output_text',
+										text: fullText,
+										annotations: [],
+									},
+								],
+							},
+						],
+						parallel_tool_calls: req.parallel_tool_calls ?? true,
+						previous_response_id: req.previous_response_id || null,
+						reasoning: { effort: null, summary: null },
+						store: req.store ?? true,
+						temperature: req.temperature ?? 1.0,
+						text: { format: { type: 'text' } },
+						tool_choice: req.tool_choice ?? 'auto',
+						tools: req.tools || [],
+						top_p: req.top_p ?? 1.0,
+						truncation: req.truncation ?? 'disabled',
+						usage: {
+							input_tokens: inputTokens,
+							input_tokens_details: { cached_tokens: 0 },
+							output_tokens: outputTokens,
+							output_tokens_details: { reasoning_tokens: 0 },
+							total_tokens: inputTokens + outputTokens,
+						},
+						user: req.user || null,
+						metadata: req.metadata || {},
+					},
+					sequence_number: ++sequenceNumber,
+				});
+
+				controller.close();
+			},
+		});
+
+		return new Response(stream, {
+			headers: {
+				...fixCors({}).headers,
+				'Content-Type': 'text/event-stream',
+				'Cache-Control': 'no-cache',
+				Connection: 'keep-alive',
+			},
+		});
+	}
+
+	// ==================== End of OpenAI Responses API ====================
 
 	private async handleOpenAI(request: Request): Promise<Response> {
 		console.log('[handleOpenAI] Starting to handle OpenAI request');
