@@ -1706,15 +1706,11 @@ export class LoadBalancer extends DurableObject {
 		const contents: any[] = [];
 
 		// Handle instructions (system message)
+		let systemInstruction: any = undefined;
 		if (req.instructions) {
-			contents.push({
-				role: 'user',
-				parts: [{ text: `[System Instructions]\n${req.instructions}` }],
-			});
-			contents.push({
-				role: 'model',
-				parts: [{ text: 'Understood. I will follow these instructions.' }],
-			});
+			systemInstruction = {
+				parts: [{ text: req.instructions }],
+			};
 		}
 
 		// Handle input - can be string or array
@@ -1724,7 +1720,88 @@ export class LoadBalancer extends DurableObject {
 				parts: [{ text: req.input }],
 			});
 		} else if (Array.isArray(req.input)) {
+			// 用于收集连续的 function_call 和 function_call_output
+			let pendingFunctionCalls: any[] = [];
+			let pendingFunctionResponses: any[] = [];
+
 			for (const item of req.input) {
+				// Handle function_call (assistant's tool call)
+				if (item.type === 'function_call') {
+					// Flush any pending function responses first
+					if (pendingFunctionResponses.length > 0) {
+						contents.push({
+							role: 'user',
+							parts: pendingFunctionResponses,
+						});
+						pendingFunctionResponses = [];
+					}
+
+					// Parse arguments
+					let args = item.arguments ?? {};
+					if (typeof args === 'string') {
+						try {
+							args = JSON.parse(args);
+						} catch {
+							args = {};
+						}
+					}
+
+					pendingFunctionCalls.push({
+						functionCall: {
+							name: item.name,
+							args: args,
+						},
+					});
+					continue;
+				}
+
+				// Handle function_call_output (tool result)
+				if (item.type === 'function_call_output') {
+					// Flush any pending function calls first
+					if (pendingFunctionCalls.length > 0) {
+						contents.push({
+							role: 'model',
+							parts: pendingFunctionCalls,
+						});
+						pendingFunctionCalls = [];
+					}
+
+					// Parse output
+					let output = item.output;
+					if (typeof output === 'string') {
+						try {
+							output = JSON.parse(output);
+						} catch {
+							// Keep as string if not valid JSON
+							output = { result: output };
+						}
+					}
+
+					pendingFunctionResponses.push({
+						functionResponse: {
+							name: item.call_id ? item.call_id.split('_')[1] : 'unknown', // Extract name from call_id
+							response: output,
+						},
+					});
+					continue;
+				}
+
+				// Flush any pending items before processing other types
+				if (pendingFunctionCalls.length > 0) {
+					contents.push({
+						role: 'model',
+						parts: pendingFunctionCalls,
+					});
+					pendingFunctionCalls = [];
+				}
+				if (pendingFunctionResponses.length > 0) {
+					contents.push({
+						role: 'user',
+						parts: pendingFunctionResponses,
+					});
+					pendingFunctionResponses = [];
+				}
+
 				if (item.type === 'message') {
 					const role = item.role === 'assistant' ? 'model' : 'user';
 					const parts: any[] = [];
@@ -1774,6 +1851,20 @@ export class LoadBalancer extends DurableObject {
 					}
 				}
 			}
+
+			// Flush any remaining pending items
+			if (pendingFunctionCalls.length > 0) {
+				contents.push({
+					role: 'model',
+					parts: pendingFunctionCalls,
+				});
+			}
+			if (pendingFunctionResponses.length > 0) {
+				contents.push({
+					role: 'user',
+					parts: pendingFunctionResponses,
+				});
+			}
 		}
 
 		// Build generation config
@@ -1788,10 +1879,16 @@ export class LoadBalancer extends DurableObject {
 			const functionDeclarations: any[] = [];
 			for (const tool of req.tools) {
 				if (tool.type === 'function') {
+					// Clean up parameters for Gemini compatibility
+					const params = tool.parameters ? { ...tool.parameters } : undefined;
+					if (params) {
+						delete params.$schema;
+						delete params.additionalProperties;
+					}
 					functionDeclarations.push({
 						name: tool.name,
 						description: tool.description,
-						parameters: tool.parameters,
+						parameters: params,
 					});
 				}
 			}
@@ -1800,11 +1897,33 @@ export class LoadBalancer extends DurableObject {
 			}
 		}
 
+		// Handle tool_choice
+		let toolConfig: any = undefined;
+		if (req.tool_choice) {
+			if (typeof req.tool_choice === 'string') {
+				if (req.tool_choice === 'required') {
+					toolConfig = { function_calling_config: { mode: 'ANY' } };
+				} else if (req.tool_choice === 'none') {
+					toolConfig = { function_calling_config: { mode: 'NONE' } };
+				}
+				// 'auto' is the default, no need to set
+			} else if (req.tool_choice.type === 'function') {
+				toolConfig = {
+					function_calling_config: {
+						mode: 'ANY',
+						allowed_function_names: [req.tool_choice.name],
+					},
+				};
+			}
+		}
+
 		return {
 			contents,
 			safetySettings,
 			generationConfig,
+			...(systemInstruction ? { system_instruction: systemInstruction } : {}),
 			...(tools.length > 0 ? { tools } : {}),
+			...(toolConfig ? { tool_config: toolConfig } : {}),
 		};
 	}
 
@@ -1836,13 +1955,27 @@ export class LoadBalancer extends DurableObject {
 			);
 		}
 
-		// Extract text from Gemini response
+		// Extract content from Gemini response
 		let outputText = '';
+		const functionCalls: any[] = [];
 		const candidate = geminiResponse.candidates?.[0];
+		
 		if (candidate?.content?.parts) {
 			for (const part of candidate.content.parts) {
 				if (part.text) {
 					outputText += part.text;
+				}
+				// Handle function calls
+				if (part.functionCall) {
+					const callId = `call_${part.functionCall.name}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+					functionCalls.push({
+						type: 'function_call',
+						id: callId,
+						call_id: callId,
+						name: part.functionCall.name,
+						arguments: JSON.stringify(part.functionCall.args || {}),
+						status: 'completed',
+					});
 				}
 			}
 		}
@@ -1851,6 +1984,31 @@ export class LoadBalancer extends DurableObject {
 		const usageMetadata = geminiResponse.usageMetadata || {};
 		const inputTokens = usageMetadata.promptTokenCount || 0;
 		const outputTokens = usageMetadata.candidatesTokenCount || 0;
+
+		// Build output array
+		const output: any[] = [];
+
+		// Add function calls first (if any)
+		for (const fc of functionCalls) {
+			output.push(fc);
+		}
+
+		// Add message with text content (if any text or if no function calls)
+		if (outputText || functionCalls.length === 0) {
+			output.push({
+				type: 'message',
+				id: messageId,
+				status: 'completed',
+				role: 'assistant',
+				content: [
+					{
+						type: 'output_text',
+						text: outputText,
+						annotations: [],
+					},
+				],
+			});
+		}
 
 		// Build OpenAI Responses API response
 		const openAIResponse = {
@@ -1864,21 +2022,7 @@ export class LoadBalancer extends DurableObject {
 			instructions: req.instructions || null,
 			max_output_tokens: req.max_output_tokens || null,
 			model: model,
-			output: [
-				{
-					type: 'message',
-					id: messageId,
-					status: 'completed',
-					role: 'assistant',
-					content: [
-						{
-							type: 'output_text',
-							text: outputText,
-							annotations: [],
-						},
-					],
-				},
-			],
+			output: output,
 			parallel_tool_calls: req.parallel_tool_calls ?? true,
 			previous_response_id: req.previous_response_id || null,
 			reasoning: {
@@ -2003,34 +2147,6 @@ export class LoadBalancer extends DurableObject {
 					sequence_number: ++sequenceNumber,
 				});
 
-				// 3. response.output_item.added
-				sendEvent({
-					type: 'response.output_item.added',
-					output_index: 0,
-					item: {
-						id: messageId,
-						status: 'in_progress',
-						type: 'message',
-						role: 'assistant',
-						content: [],
-					},
-					sequence_number: ++sequenceNumber,
-				});
-
-				// 4. response.content_part.added
-				sendEvent({
-					type: 'response.content_part.added',
-					item_id: messageId,
-					output_index: 0,
-					content_index: 0,
-					part: {
-						type: 'output_text',
-						text: '',
-						annotations: [],
-					},
-					sequence_number: ++sequenceNumber,
-				});
-
 				// Process Gemini SSE stream
 				const reader = response.body!.getReader();
 				const decoder = new TextDecoder();
@@ -2038,6 +2154,13 @@ export class LoadBalancer extends DurableObject {
 				let fullText = '';
 				let inputTokens = 0;
 				let outputTokens = 0;
+				
+				// Track function calls
+				const functionCalls: any[] = [];
+				const seenFunctionCalls = new Set<string>();
+				let outputIndex = 0;
+				let textOutputIndex = -1;
+				let textContentStarted = false;
 
 				try {
 					while (true) {
@@ -2059,14 +2182,116 @@ export class LoadBalancer extends DurableObject {
 
 									if (candidate?.content?.parts) {
 										for (const part of candidate.content.parts) {
+											// Handle function calls
+											if (part.functionCall) {
+												const funcName = part.functionCall.name;
+												const funcArgs = part.functionCall.args || {};
+												const callId = `call_${funcName}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+												
+												// Check if we've already seen this function call (by name + args hash)
+												const callKey = `${funcName}_${JSON.stringify(funcArgs)}`;
+												if (!seenFunctionCalls.has(callKey)) {
+													seenFunctionCalls.add(callKey);
+													
+													const funcCallItem = {
+														type: 'function_call',
+														id: callId,
+														call_id: callId,
+														name: funcName,
+														arguments: JSON.stringify(funcArgs),
+														status: 'completed',
+													};
+													functionCalls.push(funcCallItem);
+
+													// Send function call output item added
+													sendEvent({
+														type: 'response.output_item.added',
+														output_index: outputIndex,
+														item: {
+															type: 'function_call',
+															id: callId,
+															call_id: callId,
+															name: funcName,
+															arguments: '',
+															status: 'in_progress',
+														},
+														sequence_number: ++sequenceNumber,
+													});
+
+													// Send function call arguments delta
+													sendEvent({
+														type: 'response.function_call_arguments.delta',
+														item_id: callId,
+														output_index: outputIndex,
+														delta: JSON.stringify(funcArgs),
+														sequence_number: ++sequenceNumber,
+													});
+
+													// Send function call arguments done
+													sendEvent({
+														type: 'response.function_call_arguments.done',
+														item_id: callId,
+														output_index: outputIndex,
+														arguments: JSON.stringify(funcArgs),
+														sequence_number: ++sequenceNumber,
+													});
+
+													// Send function call output item done
+													sendEvent({
+														type: 'response.output_item.done',
+														output_index: outputIndex,
+														item: funcCallItem,
+														sequence_number: ++sequenceNumber,
+													});
+
+													outputIndex++;
+												}
+											}
+											
+											// Handle text content
 											if (part.text) {
+												// Start text content if not started
+												if (!textContentStarted) {
+													textContentStarted = true;
+													textOutputIndex = outputIndex;
+													outputIndex++;
+
+													// Send message output item added
+													sendEvent({
+														type: 'response.output_item.added',
+														output_index: textOutputIndex,
+														item: {
+															id: messageId,
+															status: 'in_progress',
+															type: 'message',
+															role: 'assistant',
+															content: [],
+														},
+														sequence_number: ++sequenceNumber,
+													});
+
+													// Send content part added
+													sendEvent({
+														type: 'response.content_part.added',
+														item_id: messageId,
+														output_index: textOutputIndex,
+														content_index: 0,
+														part: {
+															type: 'output_text',
+															text: '',
+															annotations: [],
+														},
+														sequence_number: ++sequenceNumber,
+													});
+												}
+
 												fullText += part.text;
 
 												// Send text delta
 												sendEvent({
 													type: 'response.output_text.delta',
 													item_id: messageId,
-													output_index: 0,
+													output_index: textOutputIndex,
 													content_index: 0,
 													delta: part.text,
 													sequence_number: ++sequenceNumber,
@@ -2090,38 +2315,64 @@ export class LoadBalancer extends DurableObject {
 					console.error('[handleResponsesStream] Stream error:', streamErr);
 				}
 
-				// 5. response.output_text.done
-				sendEvent({
-					type: 'response.output_text.done',
-					item_id: messageId,
-					output_index: 0,
-					content_index: 0,
-					text: fullText,
-					sequence_number: ++sequenceNumber,
-				});
+				// Build final output array
+				const finalOutput: any[] = [];
 
-				// 6. response.content_part.done
-				sendEvent({
-					type: 'response.content_part.done',
-					item_id: messageId,
-					output_index: 0,
-					content_index: 0,
-					part: {
-						type: 'output_text',
+				// Add function calls
+				for (const fc of functionCalls) {
+					finalOutput.push(fc);
+				}
+
+				// Finalize text content if started
+				if (textContentStarted) {
+					// Send text done
+					sendEvent({
+						type: 'response.output_text.done',
+						item_id: messageId,
+						output_index: textOutputIndex,
+						content_index: 0,
 						text: fullText,
-						annotations: [],
-					},
-					sequence_number: ++sequenceNumber,
-				});
+						sequence_number: ++sequenceNumber,
+					});
 
-				// 7. response.output_item.done
-				sendEvent({
-					type: 'response.output_item.done',
-					output_index: 0,
-					item: {
+					// Send content part done
+					sendEvent({
+						type: 'response.content_part.done',
+						item_id: messageId,
+						output_index: textOutputIndex,
+						content_index: 0,
+						part: {
+							type: 'output_text',
+							text: fullText,
+							annotations: [],
+						},
+						sequence_number: ++sequenceNumber,
+					});
+
+					// Send message output item done
+					sendEvent({
+						type: 'response.output_item.done',
+						output_index: textOutputIndex,
+						item: {
+							id: messageId,
+							status: 'completed',
+							type: 'message',
+							role: 'assistant',
+							content: [
+								{
+									type: 'output_text',
+									text: fullText,
+									annotations: [],
+								},
+							],
+						},
+						sequence_number: ++sequenceNumber,
+					});
+
+					finalOutput.push({
+						type: 'message',
 						id: messageId,
 						status: 'completed',
-						type: 'message',
 						role: 'assistant',
 						content: [
 							{
@@ -2130,11 +2381,45 @@ export class LoadBalancer extends DurableObject {
 								annotations: [],
 							},
 						],
-					},
-					sequence_number: ++sequenceNumber,
-				});
+					});
+				} else if (functionCalls.length === 0) {
+					// No content at all, send empty message
+					sendEvent({
+						type: 'response.output_item.added',
+						output_index: 0,
+						item: {
+							id: messageId,
+							status: 'completed',
+							type: 'message',
+							role: 'assistant',
+							content: [],
+						},
+						sequence_number: ++sequenceNumber,
+					});
 
-				// 8. response.completed
+					sendEvent({
+						type: 'response.output_item.done',
+						output_index: 0,
+						item: {
+							id: messageId,
+							status: 'completed',
+							type: 'message',
+							role: 'assistant',
+							content: [],
+						},
+						sequence_number: ++sequenceNumber,
+					});
+
+					finalOutput.push({
+						type: 'message',
+						id: messageId,
+						status: 'completed',
+						role: 'assistant',
+						content: [],
+					});
+				}
+
+				// Send response.completed
 				const completedAt = Math.floor(Date.now() / 1000);
 				sendEvent({
 					type: 'response.completed',
@@ -2149,21 +2434,7 @@ export class LoadBalancer extends DurableObject {
 						instructions: req.instructions || null,
 						max_output_tokens: req.max_output_tokens || null,
 						model: model,
-						output: [
-							{
-								type: 'message',
-								id: messageId,
-								status: 'completed',
-								role: 'assistant',
-								content: [
-									{
-										type: 'output_text',
-										text: fullText,
-										annotations: [],
-									},
-								],
-							},
-						],
+						output: finalOutput,
 						parallel_tool_calls: req.parallel_tool_calls ?? true,
 						previous_response_id: req.previous_response_id || null,
 						reasoning: { effort: null, summary: null },
