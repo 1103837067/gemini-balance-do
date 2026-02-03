@@ -4,7 +4,7 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "gemini-balance-do",
+	"name": "gemini-balance",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-08-05",
 	"keep_vars": true,//部署时保留 Cloudflare 控制台中设置的变量值，不被 vars 字段覆盖
@@ -25,9 +25,15 @@
 	"observability": {
 		"enabled": true
 	},
+	"routes": [
+		{
+			"pattern": "balance.exuils.com",
+			"custom_domain": true
+		}
+	],
 	"vars": {
-		"AUTH_KEY": "ajielu",
-		"HOME_ACCESS_KEY": "7b18e536c27ab304266db3220b8e000db8fbbe35d6e1fde729a1a1d47303858d",
+		"AUTH_KEY": "caishilongexuils2026",
+		"HOME_ACCESS_KEY": "qwe[]\\123",
 		"FORWARD_CLIENT_KEY_ENABLED": false
 	}
 	/**
